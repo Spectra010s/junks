@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+
+# junks - A simple trash CLI for Linux
+# https://github.com/Spectra010s/junks
+
+JUNKS_DIR="${JUNKS_HOME:-$HOME/.junks}"
+JUNKS_META="$JUNKS_DIR/.meta"
+
+mkdir -p "$JUNKS_DIR" "$JUNKS_META"
+
+VERSION="1.1.0"
+
+# ── Portability ────────────────────────────────────────────────────────────────
+
+_realpath() {
+  if command -v realpath &>/dev/null; then
+    realpath "$1"
+  elif command -v readlink &>/dev/null; then
+    readlink -f "$1"
+  else
+    # Manual resolve
+    local path="$1"
+    if [[ "$path" != /* ]]; then
+      path="$(pwd)/$path"
+    fi
+    echo "$path"
+  fi
+}
+
+# ── UTF-8 / plain mode detection ───────────────────────────────────────────────
+
+_is_utf8() {
+  local lang="${LANG:-}${LC_ALL:-}${LC_CTYPE:-}"
+  [[ "$lang" == *UTF-8* || "$lang" == *utf8* ]]
+}
+
+PLAIN=false
+for arg in "$@"; do
+  [[ "$arg" == "--plain" ]] && PLAIN=true
+done
+_is_utf8 || PLAIN=true
+
+_icon_file()  { $PLAIN && echo "[F]" || echo "📄"; }
+_icon_dir()   { $PLAIN && echo "[D]" || echo "📁"; }
+_icon_sep()   { $PLAIN && echo "---" || echo "─"; }
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+_usage() {
+  cat <<HELP
+junks v$VERSION - A trash bin for Linux
+
+USAGE:
+  junks <file|dir> [...]      Move one or more files/dirs to trash
+  junks restore <name>        Restore a trashed item to its original location
+    --rename                  Auto-rename if restore path already exists
+    --overwrite               Overwrite if restore path already exists
+    --to <dir>                Restore into a specific directory
+  junks list [--plain]        List all items in the trash
+  junks purge                 Permanently delete everything in the trash
+  junks purge <name>          Permanently delete a specific item
+  junks --help                Show this help message
+  junks --version             Show version
+
+EXAMPLES:
+  junks file1.txt file2.txt myfolder/
+  junks restore file1.txt --to ~/Desktop
+  junks list --plain
+  junks purge old_build/
+HELP
+}
+
+_write_meta() {
+  local id="$1" name="$2" origin="$3" timestamp="$4"
+  cat > "$JUNKS_META/$id" <<META
+name=$name
+origin=$origin
+trashed=$timestamp
+META
+}
+
+_read_meta() {
+  local id="$1" key="$2"
+  grep "^${key}=" "$JUNKS_META/$id" 2>/dev/null | cut -d= -f2-
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+_trash() {
+  local targets=("$@")
+
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    echo "junks: missing argument" >&2
+    echo "Usage: junks <file|dir> [...]" >&2
+    exit 1
+  fi
+
+  local failed=0
+  for target in "${targets[@]}"; do
+    if [[ ! -e "$target" ]]; then
+      echo "junks: '$target' does not exist" >&2
+      ((failed++))
+      continue
+    fi
+
+    local name timestamp id dest
+    name=$(basename "$target")
+    timestamp=$(date +%s)
+    id="${timestamp}-${RANDOM}"
+    dest="$JUNKS_DIR/$id"
+
+    local abs_path
+    abs_path=$(_realpath "$target")
+
+    mv "$target" "$dest"
+    _write_meta "$id" "$name" "$abs_path" "$timestamp"
+
+    echo "junks: '$name' moved to trash  [id: $id]"
+  done
+
+  [[ $failed -gt 0 ]] && exit 1
+  return 0
+}
+
+_restore() {
+  local name="$1"; shift
+  local strategy="default"
+  local to_dir=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rename)    strategy="rename" ;;
+      --overwrite) strategy="overwrite" ;;
+      --to)        to_dir="$2"; shift ;;
+      *) echo "junks: unknown restore option '$1'" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "junks: missing argument" >&2
+    echo "Usage: junks restore <name> [--rename|--overwrite|--to <dir>]" >&2
+    exit 1
+  fi
+
+  # Find matching item by name in metadata
+  local matched_id=""
+  for meta in "$JUNKS_META"/*; do
+    [[ -f "$meta" ]] || continue
+    local mname
+    mname=$(_read_meta "$(basename "$meta")" "name")
+    if [[ "$mname" == "$name" ]]; then
+      matched_id=$(basename "$meta")
+      break
+    fi
+  done
+
+  if [[ -z "$matched_id" || ! -e "$JUNKS_DIR/$matched_id" ]]; then
+    echo "junks: '$name' not found in trash" >&2
+    echo "Run 'junks list' to see what's in the trash" >&2
+    exit 1
+  fi
+
+  local origin restore_path restore_dir
+  origin=$(_read_meta "$matched_id" "origin")
+
+  if [[ -n "$to_dir" ]]; then
+    restore_path="$to_dir/$name"
+  elif [[ -n "$origin" ]]; then
+    restore_path="$origin"
+  else
+    restore_path="$(pwd)/$name"
+  fi
+
+  restore_dir=$(dirname "$restore_path")
+
+  if [[ ! -d "$restore_dir" ]]; then
+    echo "junks: original directory '$restore_dir' no longer exists, restoring to current directory" >&2
+    restore_path="$(pwd)/$name"
+  fi
+
+  if [[ -e "$restore_path" ]]; then
+    case "$strategy" in
+      rename)
+        restore_path="${restore_path}_$(date +%s)"
+        ;;
+      overwrite)
+        rm -rf "$restore_path"
+        ;;
+      *)
+        echo "junks: '$restore_path' already exists" >&2
+        echo "Use --rename, --overwrite, or --to <dir>" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  mv "$JUNKS_DIR/$matched_id" "$restore_path"
+  rm -f "$JUNKS_META/$matched_id"
+
+  echo "junks: '$name' restored to '$restore_path'"
+}
+
+_list() {
+  local sep
+  sep=$(printf '%0.s$(_icon_sep)' {1..42})
+
+  local ids=()
+  while IFS= read -r -d '' meta; do
+    ids+=("$(basename "$meta")")
+  done < <(find "$JUNKS_META" -maxdepth 1 -mindepth 1 -type f -print0 2>/dev/null)
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    echo "junks: trash is empty"
+    return
+  fi
+
+  echo "Trash (~/.junks)  [${#ids[@]} item(s)]"
+  printf '%s\n' "$(printf '─%.0s' {1..50})"
+
+  for id in "${ids[@]}"; do
+    local name origin trashed item_path icon size_info
+    name=$(_read_meta "$id" "name")
+    origin=$(_read_meta "$id" "origin")
+    trashed=$(_read_meta "$id" "trashed")
+    item_path="$JUNKS_DIR/$id"
+
+    local trashed_fmt="unknown"
+    if [[ -n "$trashed" ]]; then
+      trashed_fmt=$(date -d "@$trashed" "+%Y-%m-%d %H:%M" 2>/dev/null \
+        || date -r "$trashed" "+%Y-%m-%d %H:%M" 2>/dev/null \
+        || echo "$trashed")
+    fi
+
+    if [[ -d "$item_path" ]]; then
+      icon=$(_icon_dir)
+      local count
+      count=$(find "$item_path" | wc -l)
+      size_info="$((count - 1)) items"
+    else
+      icon=$(_icon_file)
+      size_info=$(du -sh "$item_path" 2>/dev/null | cut -f1)
+    fi
+
+    printf "%s  %-28s  %s\n" "$icon" "$name" "$trashed_fmt"
+    printf "    %-10s  ← %s\n\n" "$size_info" "$origin"
+  done
+
+  printf '%s\n' "$(printf '─%.0s' {1..50})"
+}
+
+_purge() {
+  local name="$1"
+
+  if [[ -n "$name" ]]; then
+    # Find by display name
+    local matched_id=""
+    for meta in "$JUNKS_META"/*; do
+      [[ -f "$meta" ]] || continue
+      local mname
+      mname=$(_read_meta "$(basename "$meta")" "name")
+      if [[ "$mname" == "$name" ]]; then
+        matched_id=$(basename "$meta")
+        break
+      fi
+    done
+
+    if [[ -z "$matched_id" || ! -e "$JUNKS_DIR/$matched_id" ]]; then
+      echo "junks: '$name' not found in trash" >&2
+      exit 1
+    fi
+
+    rm -rf "${JUNKS_DIR:?}/$matched_id"
+    rm -f "$JUNKS_META/$matched_id"
+    echo "junks: '$name' permanently deleted"
+  else
+    local count
+    count=$(find "$JUNKS_DIR" -maxdepth 1 -mindepth 1 ! -name '.*' | wc -l)
+
+    if [[ "$count" -eq 0 ]]; then
+      echo "junks: trash is already empty"
+      return
+    fi
+
+    read -r -p "junks: permanently delete $count item(s)? [y/N] " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      find "$JUNKS_DIR" -maxdepth 1 -mindepth 1 ! -name '.*' -exec rm -rf {} +
+      find "$JUNKS_META" -mindepth 1 -delete
+      echo "junks: trash purged"
+    else
+      echo "junks: purge cancelled"
+    fi
+  fi
+}
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+# Strip --plain from args before routing (already handled above)
+filtered_args=()
+for arg in "$@"; do
+  [[ "$arg" != "--plain" ]] && filtered_args+=("$arg")
+done
+set -- "${filtered_args[@]}"
+
+case "$1" in
+  "" | --help | -h)
+    _usage
+    ;;
+  --version | -v)
+    echo "junks v$VERSION"
+    ;;
+  restore)
+    shift
+    _restore "$@"
+    ;;
+  list)
+    _list
+    ;;
+  purge)
+    _purge "$2"
+    ;;
+  -*)
+    echo "junks: unknown option '$1'" >&2
+    echo "Run 'junks --help' for usage" >&2
+    exit 1
+    ;;
+  *)
+    _trash "$@"
+    ;;
+esac
